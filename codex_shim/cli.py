@@ -191,6 +191,31 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
+def codex_app_entry() -> int:
+    return main(["app", *sys.argv[1:]])
+
+
+def codex_model_entry() -> int:
+    args = sys.argv[1:]
+    if not args or args[0] == "list":
+        return main(["model", "list"])
+    return main(["model", "use", args[0]])
+
+
+def codex_openrouter_entry() -> int:
+    args = sys.argv[1:]
+    if args and args[0] in {"setup", "--configure", "configure"}:
+        return main(["setup", "openrouter"])
+    return main(["openrouter", *args])
+
+
+def codex_minimax_entry() -> int:
+    args = sys.argv[1:]
+    if args and args[0] in {"setup", "--configure", "configure"}:
+        return main(["setup", "minimax"])
+    return main(["minimax", *args])
+
+
 def list_providers() -> int:
     width = max(len(name) for name in PROVIDER_SPECS)
     for spec in PROVIDER_SPECS.values():

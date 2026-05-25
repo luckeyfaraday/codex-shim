@@ -9,6 +9,10 @@ dependencies = [
 
 [project.scripts]
 codex-shim = "codex_shim.cli:main"
+codex-app = "codex_shim.cli:codex_app_entry"
+codex-model = "codex_shim.cli:codex_model_entry"
+codex-openrouter = "codex_shim.cli:codex_openrouter_entry"
+codex-minimax = "codex_shim.cli:codex_minimax_entry"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
