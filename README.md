@@ -28,12 +28,29 @@ alongside everything else.
 
 ## Install
 
+Recommended (works on Windows, macOS, and Linux):
+
 ```bash
-git clone https://github.com/<you>/codex-shim ~/Documents/codex-shim
-cd ~/Documents/codex-shim
-python3 -m pip install --user aiohttp pytest    # only runtime dep is aiohttp
-ln -s "$PWD/bin/codex-shim" ~/.local/bin/codex-shim
-ln -s "$PWD/bin/codex-app"  ~/.local/bin/codex-app
+git clone https://github.com/<you>/codex-shim
+cd codex-shim
+python3 -m pip install -e .
+```
+
+This installs `aiohttp` and registers `codex-shim`, `codex-app`, `codex-model`,
+`codex-openrouter`, and `codex-minimax` as real entry-point scripts in your
+Python install's `Scripts/` (Windows) or `bin/` (POSIX) directory. As long as
+that directory is on `PATH`, the commands work from any shell — PowerShell,
+cmd, Git Bash, bash, zsh.
+
+If `pip` reports the scripts were written to a directory not on `PATH`, add it.
+On Windows, that is typically `%APPDATA%\Python\Python3xx\Scripts` (user
+install) or `<python>\Scripts` (system install).
+
+POSIX-only alternative — symlink the bash wrappers directly:
+
+```bash
+ln -s "$PWD/bin/codex-shim"  ~/.local/bin/codex-shim
+ln -s "$PWD/bin/codex-app"   ~/.local/bin/codex-app
 ln -s "$PWD/bin/codex-model" ~/.local/bin/codex-model
 ```
 
