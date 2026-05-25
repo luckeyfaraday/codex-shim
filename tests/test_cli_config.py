@@ -306,3 +306,18 @@ def test_provider_top_level_alias_runs_provider(tmp_path, monkeypatch):
 
     assert rc == 0
     assert captured == {"provider": "test-provider", "args": ["."], "port": 9998}
+
+
+def test_windows_provider_entry_delegates_to_bash_shortcut(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    monkeypatch.setattr(cli.sys, "argv", ["codex-openrouter", "."])
+    monkeypatch.setattr(cli.os, "execvp", lambda file, args: captured.update(file=file, args=args))
+
+    cli.codex_openrouter_entry()
+
+    assert captured["file"] == "bash"
+    assert captured["args"][0] == "bash"
+    assert captured["args"][1].endswith("/bin/codex-openrouter")
+    assert captured["args"][2:] == ["."]

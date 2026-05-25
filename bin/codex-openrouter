@@ -9,6 +9,7 @@ while [ -h "$SOURCE" ]; do
 done
 
 ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+export PATH="$HOME/.local/bin:$HOME/.hermes/node/bin:$HOME/.npm-global/bin:$HOME/.npm-global:$PATH"
 SETTINGS="${CODEX_SHIM_SETTINGS:-$ROOT/.codex-shim/openrouter-settings.json}"
 PORT="${CODEX_SHIM_PORT:-8766}"
 PLACEHOLDER_KEY="REPLACE_WITH_OPENROUTER_API_KEY"

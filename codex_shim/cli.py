@@ -204,6 +204,8 @@ def codex_model_entry() -> int:
 
 def codex_openrouter_entry() -> int:
     args = sys.argv[1:]
+    if sys.platform == "win32":
+        return _exec_bash_shortcut("codex-openrouter", args)
     if args and args[0] in {"setup", "--configure", "configure"}:
         return main(["setup", "openrouter"])
     return main(["openrouter", *args])
@@ -211,9 +213,26 @@ def codex_openrouter_entry() -> int:
 
 def codex_minimax_entry() -> int:
     args = sys.argv[1:]
+    if sys.platform == "win32":
+        return _exec_bash_shortcut("codex-minimax", args)
     if args and args[0] in {"setup", "--configure", "configure"}:
         return main(["setup", "minimax"])
     return main(["minimax", *args])
+
+
+def _exec_bash_shortcut(name: str, args: list[str]) -> int:
+    script = PROJECT_ROOT / "bin" / name
+    os.execvp("bash", ["bash", _windows_path_to_wsl(script), *args])
+    return 127
+
+
+def _windows_path_to_wsl(path: Path) -> str:
+    text = str(path.resolve())
+    if len(text) >= 3 and text[1:3] == ":\\":
+        drive = text[0].lower()
+        rest = text[3:].replace("\\", "/")
+        return f"/mnt/{drive}/{rest}"
+    return text.replace("\\", "/")
 
 
 def list_providers() -> int:
@@ -463,7 +482,7 @@ def start(settings_path: Path, port: int) -> int:
     env["PYTHONPATH"] = str(PROJECT_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     process = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), env=env, stdout=log, stderr=log, start_new_session=True)
     PID_PATH.write_text(str(process.pid))
-    for _ in range(50):
+    for _ in range(300):
         if _healthy(port):
             print(f"Shim started on http://{DEFAULT_HOST}:{port} with pid {process.pid}.")
             print(f"Log: {LOG_PATH}")
