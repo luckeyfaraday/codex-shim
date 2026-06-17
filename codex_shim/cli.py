@@ -351,23 +351,59 @@ def _write_provider_settings(
         spec.settings_path.parent.chmod(0o700)
     except OSError:
         pass
+    entry = {
+        "model": model,
+        "provider": spec.default_provider,
+        "base_url": base_url.rstrip("/"),
+        "api_key": api_key,
+        "display_name": display_name,
+        "max_context_limit": context,
+    }
+    models = _merge_model_row(_existing_model_rows(spec.settings_path), entry)
     old_umask = os.umask(0o077)
     try:
-        payload = {
-            "models": [
-                {
-                    "model": model,
-                    "provider": spec.default_provider,
-                    "base_url": base_url.rstrip("/"),
-                    "api_key": api_key,
-                    "display_name": display_name,
-                    "max_context_limit": context,
-                }
-            ]
-        }
-        spec.settings_path.write_text(json.dumps(payload, indent=2) + "\n")
+        spec.settings_path.write_text(json.dumps({"models": models}, indent=2) + "\n")
     finally:
         os.umask(old_umask)
+
+
+def _existing_model_rows(settings_path: Path) -> list[dict]:
+    """Return the raw model rows already stored in a provider settings file.
+
+    Reads the JSON directly (rather than through ModelSettings) so unknown or
+    camelCase fields on existing entries survive a rewrite untouched.
+    """
+    try:
+        data = json.loads(settings_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    if isinstance(data, dict):
+        rows = data.get("models") or data.get("customModels") or []
+    elif isinstance(data, list):
+        rows = data
+    else:
+        rows = []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _merge_model_row(existing: list[dict], entry: dict) -> list[dict]:
+    """Merge a setup entry into existing rows, keyed by model id.
+
+    Re-running setup for a model id already present updates that row in place
+    (idempotent); a new model id is appended so previously configured models
+    keep appearing in the picker instead of being overwritten.
+    """
+    merged: list[dict] = []
+    replaced = False
+    for row in existing:
+        if str(row.get("model") or "").strip() == entry["model"]:
+            merged.append(entry)
+            replaced = True
+        else:
+            merged.append(row)
+    if not replaced:
+        merged.append(entry)
+    return merged
 
 
 def _first_model_slug(settings_path: Path) -> str | None:

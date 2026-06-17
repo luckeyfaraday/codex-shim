@@ -291,9 +291,13 @@ MiniMax Token Plan uses `~/.codex-shim/minimax-models.json` and port `8767`.
 Real API keys belong only in those local files; committed-safe examples live in
 `examples/openrouter-models.example.json` and `examples/minimax-models.example.json`.
 
-To change the stored model or key later, rerun `codex-shim setup <provider>`.
-The prompt shows current values and lets Enter keep them; API keys are not
-echoed, and Enter keeps the existing key when one is already present.
+Rerun `codex-shim setup <provider>` any time to add or update a model. Entering
+a **new** model id appends it to the provider file, so every model you set up
+keeps appearing in the picker instead of replacing the previous one. Entering a
+model id that is already stored updates that entry in place (idempotent). The
+prompt shows current values and lets Enter keep them; API keys are not echoed,
+and Enter keeps the existing key when one is already present. To remove a model,
+edit the provider JSON file directly.
 
 Useful overrides:
 

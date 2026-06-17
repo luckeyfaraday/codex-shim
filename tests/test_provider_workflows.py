@@ -44,6 +44,70 @@ def test_provider_setup_writes_private_settings_file(tmp_path, monkeypatch):
     assert row["max_context_limit"] == 131000
 
 
+def _run_setup(monkeypatch, model, display, key="sk-test"):
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: key)
+    answers = iter([model, display, "https://openrouter.ai/api/v1", "131000"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    assert cli.setup_provider("test-openrouter") == 0
+
+
+def test_provider_setup_appends_new_model(tmp_path, monkeypatch):
+    spec = _spec(tmp_path)
+    monkeypatch.setitem(cli.PROVIDER_SPECS, "test-openrouter", spec)
+
+    _run_setup(monkeypatch, "z-ai/glm-5.2", "GLM-5.2")
+    _run_setup(monkeypatch, "xiaomi/mimo-v2.5", "MiMo-v2.5")
+
+    rows = json.loads(spec.settings_path.read_text())["models"]
+    models = [row["model"] for row in rows]
+    assert models == ["z-ai/glm-5.2", "xiaomi/mimo-v2.5"]
+
+
+def test_provider_setup_updates_existing_model_in_place(tmp_path, monkeypatch):
+    spec = _spec(tmp_path)
+    monkeypatch.setitem(cli.PROVIDER_SPECS, "test-openrouter", spec)
+
+    _run_setup(monkeypatch, "z-ai/glm-5.2", "GLM-5.2", key="sk-old")
+    _run_setup(monkeypatch, "z-ai/glm-5.2", "GLM 5.2 Renamed", key="sk-new")
+
+    rows = json.loads(spec.settings_path.read_text())["models"]
+    assert len(rows) == 1
+    assert rows[0]["display_name"] == "GLM 5.2 Renamed"
+    assert rows[0]["api_key"] == "sk-new"
+
+
+def test_provider_setup_preserves_unknown_fields_on_other_models(tmp_path, monkeypatch):
+    spec = _spec(tmp_path)
+    spec.settings_path.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "model": "z-ai/glm-5.2",
+                        "provider": "generic-chat-completion-api",
+                        "base_url": "https://openrouter.ai/api/v1",
+                        "api_key": "sk-keep",
+                        "display_name": "GLM-5.2",
+                        "extra_headers": {"X-Title": "codex"},
+                        "no_image_support": True,
+                    }
+                ]
+            },
+            indent=2,
+        )
+    )
+    monkeypatch.setitem(cli.PROVIDER_SPECS, "test-openrouter", spec)
+
+    _run_setup(monkeypatch, "xiaomi/mimo-v2.5", "MiMo-v2.5")
+
+    rows = json.loads(spec.settings_path.read_text())["models"]
+    glm = next(row for row in rows if row["model"] == "z-ai/glm-5.2")
+    assert glm["extra_headers"] == {"X-Title": "codex"}
+    assert glm["no_image_support"] is True
+    assert glm["api_key"] == "sk-keep"
+
+
 def test_provider_setup_non_interactive_missing_settings_fails(tmp_path, monkeypatch):
     spec = _spec(tmp_path)
 
