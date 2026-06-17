@@ -35,6 +35,14 @@ local:
 - **ChatGPT/Codex passthrough.** If `~/.codex/auth.json` has a valid Codex
   access token, the shim can route Codex's native `/v1/responses` traffic to
   ChatGPT's Codex backend under the `gpt-5.5` slug used by current Codex builds.
+- **Cursor/Composer passthrough.** If `cursor-agent login` is active, the shim
+  exposes `composer-2-5` and routes through your Cursor subscription — no
+  Dashboard API key (`crsr_…`) required. See
+  [`docs/subscription-integration.md`](docs/subscription-integration.md).
+- **Auto Router (optional).** Add an `Auto (smart routing)` picker entry that
+  uses a cheap classifier model to route each task to the cheapest configured
+  model that can handle it — trivial turns stay cheap, hard turns escalate. See
+  [`docs/AUTO_ROUTER.md`](docs/AUTO_ROUTER.md).
 - **Prompt-catching/proxy-friendly architecture.** Put a local proxy in front
   of the shim to dedupe boilerplate, inject stable instructions, repair
   pseudo-tool text, or route prompts by policy before they hit an upstream.
@@ -349,13 +357,14 @@ Recommended schema:
 }
 ```
 
-The loader also accepts camelCase aliases (`baseUrl`, `apiKey`, `displayName`,
-`maxContextLimit`, `maxOutputTokens`, `noImageSupport`, `extraHeaders`) and a
-legacy top-level `customModels` array, so existing model config exports can be
-used directly.
+The loader also accepts camelCase aliases (`baseUrl`, `apiKey`, `apiKeyEnv`,
+`displayName`, `maxContextLimit`, `maxOutputTokens`, `noImageSupport`,
+`extraHeaders`) and a legacy top-level `customModels` array, so existing model
+config exports can be used directly.
 
-The shim **never copies your API keys** into the generated catalog. Keys stay
-in your settings file and are read fresh on every request.
+The shim **never writes your API keys** into the generated catalog. Put literal
+keys in your settings file or reference them with `api_key_env`; credentials
+are resolved when requests are handled.
 
 Supported `provider` values:
 
@@ -366,15 +375,72 @@ Supported `provider` values:
 | `minimax` | MiniMax Token Plan `/v1/chat/completions` |
 | `anthropic` | Anthropic `/v1/messages` |
 
+The shim also accepts Anthropic Messages requests at
+`http://127.0.0.1:8765/v1/messages`. For `openai` and
+`generic-chat-completion-api` models, it translates Messages requests to
+OpenAI-shaped chat completions and converts responses back to Anthropic shape.
+For `anthropic` models, it passes the request through to the upstream
+`/messages` endpoint with the configured model name. The bridge supports text,
+image inputs, basic function tools/tool results, and streaming SSE. Provider
+features such as prompt caching, extended thinking signatures, files, and token
+counting remain upstream-specific.
+
 Useful model fields:
 
 | field | behavior |
 |---|---|
 | `display_name` | Human-readable picker label. |
+| `api_key_env` | Name of an environment variable that contains the upstream API key. |
 | `max_context_limit` | Catalog context window and compaction limits. |
 | `max_output_tokens` | Default max output when translating to Anthropic. |
 | `no_image_support` | When true, catalog advertises text-only input. |
 | `extra_headers` | Optional upstream headers merged into requests. |
+
+### OpenCode Go
+
+OpenCode Go adds and updates models over time. Refresh the local settings from
+the live OpenCode Go catalog instead of copying a hard-coded model list:
+
+```bash
+export OPENCODE_GO_API_KEY="..."
+codex-shim opencode-go refresh
+codex-shim generate
+codex-shim start
+```
+
+The refresh command calls `https://opencode.ai/zen/go/v1/models`, probes each
+model through both `/chat/completions` and `/messages`, and writes `ocgo-*`
+entries into `~/.codex-shim/models.json`. Models that work through chat
+completions are configured as `generic-chat-completion-api`; models that only
+work through Messages are configured as `anthropic`.
+
+Use `--settings` to write a different file, `--api-key-env` to use a different
+environment variable name, or `--prefer messages` if you want models that
+support both routes to prefer Anthropic Messages:
+
+```bash
+codex-shim --settings /path/to/models.json opencode-go refresh --prefer messages
+```
+
+If you need a minimal manual fallback, add one model with the same key env:
+
+```json
+{
+  "models": [
+    {
+      "slug": "ocgo-glm-5-1",
+      "model": "glm-5.1",
+      "display_name": "OpenCode Go GLM 5.1",
+      "provider": "generic-chat-completion-api",
+      "base_url": "https://opencode.ai/zen/go/v1",
+      "api_key_env": "OPENCODE_GO_API_KEY"
+    }
+  ]
+}
+```
+
+The current OpenCode Go model list and endpoint split are documented at
+<https://opencode.ai/docs/go/>.
 
 ### Ollama / local OpenAI-compatible chat endpoints
 
@@ -422,7 +488,14 @@ that hides any model whose slug is not on a hardcoded list. Custom catalog
 entries fall into the hidden bucket and never render in the picker.
 
 A single-boolean ASAR patch flips the allowlist branch off so the picker only
-checks the local `hidden` flag (which this catalog never sets).
+checks the local `hidden` flag (which this catalog never sets). On recent
+Codex Desktop builds, the patch also changes the local recent-thread loader
+from `modelProviders: null` to `modelProviders: []` so the sidebar continues to
+show existing native `openai` chats while Desktop is routed through the
+`codex_shim` provider.
+
+The combined patch has been tested on Codex Desktop **26.519.41501** /
+`codex-cli 0.133.0-alpha.1` on macOS arm64.
 
 > Back up `app.asar` and `Info.plist` before patching.
 
@@ -440,7 +513,22 @@ sed -i.bak -E 's/let u=c\.useHiddenModels&&o!==`amazonBedrock`,d;/let u=!1,d;/' 
 diff "$PATCH_FILE.bak" "$PATCH_FILE" || true
 rm "$PATCH_FILE.bak"
 
-# 3. Repack
+# 3. Patch the sidebar recent-thread provider filter (single occurrence)
+SIDEBAR_FILE=$(grep -RIl 'listRecentThreads' extracted/webview/assets/app-server-manager-signals-*.js | head -n1)
+python3 - "$SIDEBAR_FILE" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+old = "listRecentThreads({cursor:e,limit:t}){return this.params.requestClient.sendRequest(`thread/list`,{limit:t,cursor:e,sortKey:this.recentConversationSortKey,modelProviders:null,archived:!1,sourceKinds:ke})}"
+new = "listRecentThreads({cursor:e,limit:t}){return this.params.requestClient.sendRequest(`thread/list`,{limit:t,cursor:e,sortKey:this.recentConversationSortKey,modelProviders:[],archived:!1,sourceKinds:ke})}"
+if text.count(old) != 1:
+    raise SystemExit("expected one sidebar provider filter occurrence")
+path.write_text(text.replace(old, new, 1))
+PY
+
+# 4. Repack
 npx --yes @electron/asar pack extracted app.asar.new
 sudo cp app.asar.new "$APP/Contents/Resources/app.asar"
 ```
@@ -450,7 +538,7 @@ That alone can crash Codex on next launch with `EXC_BREAKPOINT`. Electron's
 header** of the ASAR archive (not the whole file). Recompute it and re-sign:
 
 ```bash
-# 4. Compute new header hash
+# 5. Compute new header hash
 HEADER_HASH=$(python3 - "$APP/Contents/Resources/app.asar" <<'PY'
 import struct, hashlib, sys
 with open(sys.argv[1], 'rb') as f:
@@ -461,29 +549,30 @@ PY
 )
 echo "new header hash: $HEADER_HASH"
 
-# 5. Patch Info.plist (replaces the hash for Resources/app.asar)
+# 6. Patch Info.plist (replaces the hash for Resources/app.asar)
 sudo /usr/libexec/PlistBuddy -c \
   "Set :ElectronAsarIntegrity:Resources/app.asar:hash $HEADER_HASH" \
   "$APP/Contents/Info.plist"
 
-# 6. Ad-hoc re-sign
+# 7. Ad-hoc re-sign
 sudo codesign --force --deep --sign - "$APP"
 
-# 7. Launch
+# 8. Launch
 open "$APP"
 ```
 
 To roll back: `sudo rm -rf "$APP" && sudo mv "$APP.unpatched-…" "$APP"`.
 
-The CLI also has helper commands for patching/restoring `app.asar`:
+The CLI also has helper commands for patching/restoring `app.asar` and the
+matching ASAR integrity metadata:
 
 ```bash
 codex-shim patch-app
 codex-shim restore-app
 ```
 
-If Codex still crashes after `patch-app`, use the manual hash-update steps above
-or restore with `codex-shim restore-app`.
+If Codex still crashes after `patch-app`, restore with `codex-shim restore-app`
+and re-check the manual patch needles against the installed Desktop build.
 
 ---
 
@@ -520,6 +609,31 @@ that prefix as an alias and routes it to the same passthrough.
 
 ---
 
+## Cursor/Composer passthrough (subscription)
+
+If `cursor-agent status` shows you are logged in, the shim exposes
+**Composer 2.5** as slug `composer-2-5` and routes each request by spawning
+`cursor-agent` with your CLI OAuth session — the same pattern
+[Open Design](https://github.com/nexu-io/open-design) uses for Cursor Agent.
+
+```bash
+cursor-agent login
+scripts/codex-shim-install-cursor-composer
+codex-shim model use composer-2-5
+codex-app
+```
+
+The install helper is optional; it regenerates the local catalog/config and
+sets `composer-2-5` as the active model when `cursor-agent status` reports an
+active login. Troubleshoot with `cursor-agent status` and `/health`, which
+reports `cursor_passthrough: true` when the shim can expose Composer.
+
+Do **not** configure Composer via `cursor-api.standardagents.ai` unless you
+intentionally want Dashboard API-key billing (`crsr_…`). That path is BYOK,
+not CLI subscription.
+
+---
+
 ## How routing works
 
 ```text
@@ -545,6 +659,53 @@ GLM, etc.) round-trip through `reasoning.encrypted_content` items.
 
 ---
 
+## Auto Router (smart routing)
+
+Optionally add one extra picker entry — **`Auto (smart routing)`** (slug
+`codex-auto`) — that chooses the right model *per task*: trivial turns go to a
+cheap model, hard turns escalate to your strongest one. It runs entirely on the
+models you already configure.
+
+On each new task the shim asks a cheap **classifier** model you nominate to score
+every candidate `0.0–1.0` (how likely it nails the task first try), reading a
+short **capability card** per candidate. It then routes to the **cheapest
+candidate whose score clears `threshold`** (default `0.7`), caches that decision
+for the task's tool-call round-trips, and falls back safely on any error. The
+classifier never sees price, so it can't be biased toward expensive models.
+
+Turn it on by adding a `router` block to `~/.codex-shim/models.json`:
+
+```jsonc
+"router": {
+  "enabled": true,
+  "slug": "codex-auto",
+  "classifier": "minimax-m3",        // slug of a cheap configured model
+  "threshold": 0.7,
+  "default": "minimax-m3",
+  "cache": true,
+  "candidates": [
+    { "slug": "minimax-m3", "cost": 0.3, "supports_images": false,
+      "card": "Cheap, fast. Single-file edits, codegen, simple refactors." },
+    { "slug": "opus", "cost": 5.0, "supports_images": true,
+      "card": "Frontier. Big multi-file refactors, hard debugging, images." }
+  ]
+}
+```
+
+Prove it end to end with no keys and no network:
+
+```bash
+python3 examples/auto_router_demo.py
+```
+
+It spins up a mock multi-backend server, starts the **real** shim with the router
+on, and shows trivial→cheap, medium→mid, hard→strong, image→image-capable, and a
+repeat served from cache. Full configuration, env knobs (`CODEX_SHIM_ROUTER_LOG`,
+`CODEX_SHIM_DISABLE_ROUTER`, …), and failure behavior are in
+[`docs/AUTO_ROUTER.md`](docs/AUTO_ROUTER.md).
+
+---
+
 ## Tool calls and agent loops
 
 Codex expects Responses-API output items. Most BYOK upstreams speak either
@@ -562,17 +723,52 @@ This is the piece that makes the shim useful for real Codex runs instead of only
 text chat. A model can ask Codex to run tools, Codex sends the tool output back
 through the shim, and the upstream model continues the same loop.
 
+Native Responses-only tools now have BYOK fallbacks:
+
+| Responses tool | Chat/Anthropic fallback |
+|---|---|
+| `computer_use` / `computer_use_preview` | `computer_use` function with `{action, x, y, text, ...}` |
+| `web_search` / `web_search_preview` | `web_search` function with `{query, ...}` |
+| `apply_patch` | `apply_patch` function with `{patch, ...}` |
+| `local_shell` / `shell` | `local_shell` function with `{command, ...}` |
+| Codex MCP functions | Passed through as normal function tools |
+
+That keeps BYOK models inside the Codex agent loop even when the upstream API is
+chat-completions or Anthropic Messages instead of native Responses. ChatGPT
+passthrough remains the highest-fidelity path for first-party hosted tool item
+shapes, but BYOK routes no longer drop those tools. Visual feedback is preserved
+for vision-capable BYOK providers: Responses `input_image`, `computer_call_output`
+screenshots, and visual `function_call_output` payloads become OpenAI chat
+`image_url` parts or Anthropic image blocks instead of being flattened to text.
+
 Known edge cases:
 
-- Native Responses-only tool types such as freeform `apply_patch`, hosted
-  `web_search`, or `computer_use` are only fully native on the ChatGPT
-  passthrough path. Chat-completions and Anthropic upstreams receive function
-  tools after translation.
+- BYOK native-tool fallbacks depend on the Codex client/harness recognizing and
+  executing the fallback function call. The shim translates tool schemas and
+  round-trips tool outputs; it does not execute computer, shell, patch, or MCP
+  actions itself.
 - Some OpenAI-compatible providers advertise tool calls but stream malformed
   JSON arguments. The shim preserves deltas; the provider still has to emit
   valid JSON by the end of the call.
 - If a provider ignores `parallel_tool_calls`, Codex may still request one tool
   at a time. That is an upstream behavior, not a catalog issue.
+
+---
+
+## Compaction
+
+Codex can compact long sessions through `POST /v1/responses/compact`.
+
+| route | behavior |
+|---|---|
+| ChatGPT passthrough (`gpt-5.5` / `openai-gpt-5-5*`) | Forwards to ChatGPT's native `/backend-api/codex/responses/compact` endpoint and rewrites returned model metadata back to the requested shim slug. |
+| BYOK OpenAI/chat-completions providers | Sends a non-streaming summarization request through `/chat/completions`, then returns a Responses-shaped compacted window whose `output` can be used as the next `input`. |
+| BYOK Anthropic providers | Sends a non-streaming compact request through `/messages`, then returns the same Responses-shaped compacted window. |
+
+The BYOK path intentionally strips provider-hostile fields such as `stream` and
+`service_tier` before forwarding. It preserves the practical Codex behavior — a
+smaller next context window — without pretending third-party chat APIs can emit
+OpenAI's opaque encrypted compaction items.
 
 ---
 
@@ -594,13 +790,15 @@ What that means in practice:
 
 - **Shell/file operations** are still executed by Codex Desktop/CLI. The shim
   only translates the model request and response stream.
-- **Images/screenshots** can pass to providers that accept images. Set
-  `noImageSupport: true` for text-only upstreams so Codex does not send image
-  content they cannot parse.
-- **Computer-use/native hosted tools** should use the ChatGPT passthrough path
-  for best fidelity. BYOK chat/Anthropic routes can still participate in Codex
-  tool loops, but hosted Responses-only tool item types are not equivalent to
-  normal function tools.
+- **Images/screenshots** can pass to providers that accept images. Responses
+  `input_image` items, `computer_call_output` screenshots, and visual tool
+  outputs are preserved as OpenAI chat `image_url` parts or Anthropic image
+  blocks. Set `noImageSupport: true` for text-only upstreams so Codex does not
+  send image content they cannot parse.
+- **Computer-use/native hosted tools** use native Responses item types on the
+  ChatGPT passthrough path. BYOK chat/Anthropic routes receive deterministic
+  function-tool fallbacks (`computer_use`, `web_search`, `apply_patch`,
+  `local_shell`) so they can stay in the same Codex tool loop.
 
 Codex Desktop forwards three generic MCP tools to every model:
 
@@ -722,10 +920,13 @@ codex-shim generate          regenerate catalog/config without starting daemon
 codex-shim start             regenerate catalog and start local shim daemon
 codex-shim enable            start daemon and write managed ~/.codex/config.toml block
 codex-shim status            health check + model count
+codex-shim doctor            read-only local diagnostics report
 codex-shim stop              stop daemon
 codex-shim disable           remove managed config block and stop daemon
 codex-shim restart           stop, regenerate, and start daemon
 codex-shim list              list generated slugs and upstream routes
+codex-shim opencode-go refresh
+                            refresh OpenCode Go models into the settings file
 codex-shim model list        list slugs currently usable in the picker
 codex-shim model use <slug>  set the Desktop default model in managed config
 codex-shim codex -- <args>   exec `codex` CLI through inline shim overrides
@@ -744,17 +945,52 @@ codex-model [list|<slug>]    shortcut for `codex-shim model …`
 
 Global flags:
 
-- `--settings <path>`: used by catalog/model/start/app/codex flows.
-- `--port <port>`: used by daemon/provider flows.
+- `--settings <path>`: used by catalog/model/start/app/codex/doctor flows.
+- `--port <port>`: used by daemon/provider/doctor flows.
 
 `patch-app` and `restore-app` always target `/Applications/Codex.app`, do not
 use `--settings`, and exit with a clear error on Windows/Linux.
 
 ---
 
+## Model picker (web UI)
+
+The shim exposes a small browser UI for switching the active model without
+restarting the CLI:
+
+- `GET /picker` — self-contained HTML page (dark theme) listing every model
+  the shim currently knows about, with the active one highlighted.
+- `GET /api/models` — JSON list backing the picker.
+- `POST /api/switch` — `{"slug": "...", "restart_codex": true|false}`. The
+  shim rewrites `model = "..."` and the `[model_providers.codex_shim]`
+  `name = "..."` in `~/.codex/config.toml` so the Codex Desktop UI shows
+  the selected model's display name (e.g. "Kimi K2.6") instead of the
+  generic "Codex Shim" label, and optionally relaunches Codex Desktop
+  (`open -a Codex` on macOS, `taskkill` + `Codex.exe` on Windows). This
+  state-changing picker endpoint requires the per-process
+  `X-Codex-Shim-Picker-Token` header embedded in `/picker`.
+
+All picker routes are behind the same `Host`-header allowlist as the rest of
+the shim, so a visited web page cannot drive them via DNS rebinding. The
+state-changing `/api/switch` endpoint also requires a per-process picker token,
+so third-party pages cannot trigger model switches just because the loopback
+server is reachable.
+
+---
+
 ## Security and privacy
 
 - The shim binds to `127.0.0.1` by default.
+- The shim validates the `Host` header on every request and rejects anything
+  that is not a loopback name (`127.0.0.1`, `localhost`, `::1`), the configured
+  bind host, or an entry in `CODEX_SHIM_ALLOWED_HOSTS`. This blocks DNS-rebinding
+  attacks where a web page you visit resolves its own domain to `127.0.0.1` and
+  drives the shim with your credentials. If you deliberately bind to a
+  non-loopback host, add the host(s) you reach it by to
+  `CODEX_SHIM_ALLOWED_HOSTS` (comma-separated).
+- The model picker protects its state-changing `/api/switch` endpoint with a
+  per-process picker token, so cross-site pages cannot switch the active model
+  or request a Desktop restart without loading the picker page.
 - API keys stay in your settings file; the generated catalog does not contain
   them.
 - Request logs are summary-level by default and avoid full prompt/API-key dumps.
@@ -785,9 +1021,17 @@ use `--settings`, and exit with a clear error on Windows/Linux.
 ### Shim will not start
 
 ```bash
+codex-shim doctor
 codex-shim status
 tail -n 80 .codex-shim/shim.log
 ```
+
+`codex-shim doctor` prints a read-only diagnostics report grouped by section
+(Python, dependencies, Codex CLI, settings, runtime files, daemon health,
+passthrough availability, proxy bypass, and Codex config). It never writes
+configuration, starts/stops the daemon, calls model providers, or prints API
+keys/tokens. It exits 1 only when a hard `FAIL` is detected; warnings are meant
+as local setup hints.
 
 Common causes:
 

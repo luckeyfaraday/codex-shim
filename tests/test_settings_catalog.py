@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import plistlib
+import struct
 
 import pytest
 
 from codex_shim import cli
 from codex_shim.catalog import catalog_entry, write_catalog
-from codex_shim.settings import ModelSettings, chatgpt_passthrough_available
+from codex_shim.opencode_go import opencode_go_model_row, write_opencode_go_models
+from codex_shim.settings import ModelSettings, chatgpt_passthrough_available, FALLBACK_CHATGPT_PASSTHROUGH_SLUGS
 
 
 @pytest.fixture
@@ -55,6 +59,207 @@ def test_legacy_custom_models_schema_still_loads(tmp_path):
     assert model.slug == "legacy-model"
     assert model.display_name == "Legacy Model"
     assert model.base_url == "http://x/v1"
+
+
+def test_api_key_env_resolves_environment_value(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENAI_COMPAT_KEY", "env-secret")
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "model": "env-model",
+                        "provider": "generic-chat-completion-api",
+                        "base_url": "http://x/v1",
+                        "api_key_env": "OPENAI_COMPAT_KEY",
+                    }
+                ]
+            }
+        )
+    )
+
+    [model] = ModelSettings(settings).load()
+
+    assert model.api_key == "env-secret"
+
+
+def test_api_key_env_falls_back_to_literal_api_key(monkeypatch, tmp_path):
+    monkeypatch.delenv("OPENAI_COMPAT_KEY", raising=False)
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "model": "env-model",
+                        "provider": "generic-chat-completion-api",
+                        "base_url": "http://x/v1",
+                        "api_key_env": "OPENAI_COMPAT_KEY",
+                        "api_key": "literal-secret",
+                    }
+                ]
+            }
+        )
+    )
+
+    [model] = ModelSettings(settings).load()
+
+    assert model.api_key == "literal-secret"
+
+
+def test_api_key_env_missing_without_literal_stays_empty(monkeypatch, tmp_path):
+    monkeypatch.delenv("OPENAI_COMPAT_KEY", raising=False)
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "model": "env-model",
+                        "provider": "generic-chat-completion-api",
+                        "base_url": "http://x/v1",
+                        "api_key_env": "OPENAI_COMPAT_KEY",
+                    }
+                ]
+            }
+        )
+    )
+
+    [model] = ModelSettings(settings).load()
+
+    assert model.api_key == ""
+
+
+def test_opencode_go_model_row_prefers_chat_and_prefixes_slug():
+    row = opencode_go_model_row(
+        "glm-5.1",
+        chat_status=200,
+        messages_status=200,
+        api_key_env="OPENCODE_GO_API_KEY",
+        base_url="https://opencode.ai/zen/go/v1",
+        prefer="chat",
+    )
+
+    assert row == {
+        "slug": "ocgo-glm-5-1",
+        "model": "glm-5.1",
+        "display_name": "OpenCode Go GLM 5.1",
+        "provider": "generic-chat-completion-api",
+        "base_url": "https://opencode.ai/zen/go/v1",
+        "api_key_env": "OPENCODE_GO_API_KEY",
+        "no_image_support": True,
+        "generated_by": "codex-shim opencode-go refresh",
+        "opencode_go_endpoint": "chat",
+    }
+
+
+def test_opencode_go_model_row_uses_messages_when_chat_fails():
+    row = opencode_go_model_row(
+        "qwen3.7-max",
+        chat_status=401,
+        messages_status=200,
+        api_key_env="OPENCODE_GO_API_KEY",
+        base_url="https://opencode.ai/zen/go/v1",
+        prefer="chat",
+    )
+
+    assert row["slug"] == "ocgo-qwen3-7-max"
+    assert row["provider"] == "anthropic"
+    assert row["opencode_go_endpoint"] == "messages"
+
+
+def test_write_opencode_go_models_replaces_previous_generated_rows(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENCODE_GO_API_KEY", "ocgo-secret")
+    settings = tmp_path / "models.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {"model": "manual", "provider": "openai", "base_url": "http://manual/v1", "api_key": "k"},
+                    {
+                        "slug": "ocgo-old",
+                        "model": "old",
+                        "provider": "generic-chat-completion-api",
+                        "base_url": "https://opencode.ai/zen/go/v1",
+                        "api_key_env": "OPENCODE_GO_API_KEY",
+                        "generated_by": "codex-shim opencode-go refresh",
+                    },
+                ]
+            }
+        )
+    )
+
+    write_opencode_go_models(
+        settings,
+        [
+            opencode_go_model_row(
+                "glm-5.1",
+                chat_status=200,
+                messages_status=200,
+                api_key_env="OPENCODE_GO_API_KEY",
+                base_url="https://opencode.ai/zen/go/v1",
+                prefer="chat",
+            )
+        ],
+    )
+    models = ModelSettings(settings).load()
+
+    assert [model.slug for model in models] == ["manual", "ocgo-glm-5-1"]
+    assert [model.api_key for model in models] == ["k", "ocgo-secret"]
+
+
+def test_write_opencode_go_models_preserves_legacy_custom_models_key(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENCODE_GO_API_KEY", "ocgo-secret")
+    settings = tmp_path / "models.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "customModels": [
+                    {"model": "legacy", "provider": "openai", "baseUrl": "http://legacy/v1", "apiKey": "k"},
+                ]
+            }
+        )
+    )
+
+    write_opencode_go_models(
+        settings,
+        [
+            opencode_go_model_row(
+                "glm-5.1",
+                chat_status=200,
+                messages_status=200,
+                api_key_env="OPENCODE_GO_API_KEY",
+                base_url="https://opencode.ai/zen/go/v1",
+                prefer="chat",
+            )
+        ],
+    )
+
+    on_disk = json.loads(settings.read_text())
+    assert "customModels" in on_disk
+    assert "models" not in on_disk
+    assert [row["model"] for row in on_disk["customModels"]] == ["legacy", "glm-5.1"]
+
+
+def test_refresh_opencode_go_cli_writes_discovered_models(monkeypatch, tmp_path, capsys):
+    settings = tmp_path / "models.json"
+    monkeypatch.setenv("OPENCODE_GO_API_KEY", "ocgo-secret")
+    monkeypatch.setattr("codex_shim.opencode_go.fetch_opencode_go_model_ids", lambda *_args, **_kwargs: ["glm-5.1", "qwen3.7-max"])
+    monkeypatch.setattr("codex_shim.opencode_go.probe_chat_model", lambda _base, _key, model, **_kwargs: 401 if model == "qwen3.7-max" else 200)
+    monkeypatch.setattr("codex_shim.opencode_go.probe_messages_model", lambda _base, _key, _model, **_kwargs: 200)
+
+    assert cli.main(["--settings", str(settings), "opencode-go", "refresh"]) == 0
+
+    out = capsys.readouterr().out
+    assert "Refreshed 2 OpenCode Go models" in out
+    assert "ocgo-glm-5-1" in out
+    assert "ocgo-qwen3-7-max" in out
+    models = ModelSettings(settings).load()
+    assert [(model.slug, model.provider) for model in models] == [
+        ("ocgo-glm-5-1", "generic-chat-completion-api"),
+        ("ocgo-qwen3-7-max", "anthropic"),
+    ]
 
 
 def test_ollama_launch_models_schema_loads(tmp_path):
@@ -181,11 +386,13 @@ def test_write_catalog_omits_gpt55_when_auth_missing(tmp_path, auth_missing):
     assert data == {"models": []}
 
 
-def test_write_catalog_includes_gpt55_when_auth_present(tmp_path, auth_present):
+def test_write_catalog_includes_gpt_models_when_auth_present(tmp_path, auth_present, monkeypatch):
+    missing_cache = tmp_path / "missing-models-cache.json"
+    monkeypatch.setattr("codex_shim.settings.DEFAULT_CODEX_MODELS_CACHE", missing_cache)
     catalog_path = tmp_path / "catalog.json"
     write_catalog([], catalog_path)
     data = json.loads(catalog_path.read_text())
-    assert [model["slug"] for model in data["models"]] == ["gpt-5.5"]
+    assert [model["slug"] for model in data["models"]] == list(FALLBACK_CHATGPT_PASSTHROUGH_SLUGS)
 
 
 def test_managed_config_escapes_windows_catalog_path(monkeypatch):
@@ -297,6 +504,119 @@ def test_restore_app_fails_off_macos(monkeypatch, capsys):
     assert "macOS-only" in capsys.readouterr().err
 
 
+def _make_picker_bundle(
+    vars_uo: str = "u",
+    vars_c: str = "c",
+    vars_o: str = "a",
+    vars_d: str = "f",
+) -> str:
+    """Old-style bundle: filter lives in model-queries-*.js inline as
+    `let u=c.useHiddenModels&&o!==`amazonBedrock`,d;`. Followed by a
+    forEach so the APPLIED marker (which sniffs for `=!1[,;]...forEach`) can
+    confirm idempotency after patching.
+    """
+    return (
+        f"prefix let {vars_uo}={vars_c}.useHiddenModels&&{vars_o}!==`amazonBedrock`,{vars_d};"
+        f"return models.forEach(n=>{{}}) suffix"
+    )
+
+
+def _make_new_picker_bundle(
+    vars_s: str = "s",
+    vars_i: str = "i",
+    vars_e: str = "e",
+) -> str:
+    """New-style bundle: filter helper extracted into
+    models-and-reasoning-efforts-*.js with a bare-identifier RHS:
+    `s=i&&e!==`amazonBedrock`;` (note: no `let`, terminator is `;`)."""
+    return (
+        f"function p(){{let a=[],o=null,{vars_s}={vars_i}&&{vars_e}!==`amazonBedrock`;"
+        f"return r.forEach(n=>{{if({vars_s}?t.has(n.model):!n.hidden){{}}}})}}"
+    )
+
+
+def _make_sidebar_bundle(sk: str = "ye", model_providers: str = "null") -> str:
+    return (
+        "prefix listRecentThreads({cursor:e,limit:t})"
+        "{return this.params.requestClient.sendRequest(`thread/list`,"
+        "{limit:t,cursor:e,sortKey:this.recentConversationSortKey,"
+        f"modelProviders:{model_providers},archived:!1,sourceKinds:{sk}}})}}"
+        " suffix"
+    )
+
+
+def test_desktop_bundle_patch_applies_model_picker_and_sidebar(tmp_path):
+    assets = tmp_path / "webview" / "assets"
+    assets.mkdir(parents=True)
+    model_bundle = assets / "model-queries-test.js"
+    sidebar_bundle = assets / "app-server-manager-signals-test.js"
+    model_bundle.write_text(_make_picker_bundle())
+    sidebar_bundle.write_text(_make_sidebar_bundle())
+
+    assert cli._patch_codex_desktop_bundles(tmp_path) is True
+    assert "let u=!1,f;" in model_bundle.read_text()
+    assert "modelProviders:[],archived:!1,sourceKinds:ye" in sidebar_bundle.read_text()
+    assert cli._patch_codex_desktop_bundles(tmp_path) is False
+
+
+def test_desktop_bundle_patch_handles_renamed_minifier_locals(tmp_path):
+    """Older Codex Desktop builds shuffle obfuscated variable names; the regex
+    needles must still match and preserve those names in the replacement."""
+    assets = tmp_path / "webview" / "assets"
+    assets.mkdir(parents=True)
+    model_bundle = assets / "model-queries-test.js"
+    sidebar_bundle = assets / "app-server-manager-signals-test.js"
+    model_bundle.write_text(_make_picker_bundle(vars_o="o", vars_d="d"))
+    sidebar_bundle.write_text(_make_sidebar_bundle(sk="ke"))
+
+    assert cli._patch_codex_desktop_bundles(tmp_path) is True
+    assert "let u=!1,d;" in model_bundle.read_text()
+    assert "modelProviders:[],archived:!1,sourceKinds:ke" in sidebar_bundle.read_text()
+
+
+def test_desktop_bundle_patch_handles_extracted_filter_helper(tmp_path):
+    """Recent Codex Desktop builds factor the filter into
+    models-and-reasoning-efforts-*.js with a bare-identifier RHS (no `let`,
+    `;` terminator). Sidebar is already shipped with `modelProviders:[]`, so
+    the sidebar patch should report idempotent."""
+    assets = tmp_path / "webview" / "assets"
+    assets.mkdir(parents=True)
+    new_picker = assets / "models-and-reasoning-efforts-test.js"
+    sidebar = assets / "app-server-manager-signals-test.js"
+    new_picker.write_text(_make_new_picker_bundle())
+    sidebar.write_text(_make_sidebar_bundle(model_providers="[]", sk="pe"))
+
+    assert cli._patch_codex_desktop_bundles(tmp_path) is True
+    assert "s=!1;" in new_picker.read_text()
+    assert "amazonBedrock" not in new_picker.read_text()
+    assert "modelProviders:[],archived:!1,sourceKinds:pe" in sidebar.read_text()
+    assert cli._patch_codex_desktop_bundles(tmp_path) is False
+
+
+def test_desktop_bundle_patch_fails_when_sidebar_needle_is_missing(tmp_path):
+    assets = tmp_path / "webview" / "assets"
+    assets.mkdir(parents=True)
+    (assets / "model-queries-test.js").write_text(_make_picker_bundle())
+    (assets / "app-server-manager-signals-test.js").write_text("different build")
+
+    assert cli._patch_codex_desktop_bundles(tmp_path) is None
+
+
+def test_update_app_asar_integrity_uses_asar_json_header_hash(tmp_path):
+    header_json = b'{"files":{"x":{"offset":"0","size":1}}}'
+    app_asar = tmp_path / "app.asar"
+    app_asar.write_bytes(struct.pack("<4I", 4, len(header_json), 0, len(header_json)) + header_json + b"x")
+    info_plist = tmp_path / "Info.plist"
+    info_plist.write_bytes(
+        plistlib.dumps({"ElectronAsarIntegrity": {"Resources/app.asar": {"hash": "old"}}})
+    )
+
+    cli._update_app_asar_integrity(app_asar, info_plist)
+
+    data = plistlib.loads(info_plist.read_bytes())
+    assert data["ElectronAsarIntegrity"]["Resources/app.asar"]["hash"] == hashlib.sha256(header_json).hexdigest()
+
+
 class ModelSettingsFixture:
     @staticmethod
     def one():
@@ -313,6 +633,7 @@ class ModelSettingsFixture:
                             "display_name": "Claude Opus",
                             "provider": "anthropic",
                             "base_url": "http://anthropic",
+                            "apiKey": "stub",
                             "max_context_limit": 200000,
                         }
                     ]
